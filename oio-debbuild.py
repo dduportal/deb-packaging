@@ -31,16 +31,27 @@ import glob
 import shutil
 import argparse
 import subprocess
+from zipfile import ZipFile
+import tarfile
 
 ################################################################################
 
 _VERBOSE = False
 
+(_ERROR, _WARN, _INFO) = range(3)
 
-def vprint(msg):
+_VPRINT_PREFIX = {
+    _ERROR: 'ERROR: ',
+    _WARN:  'WARNING: ',
+    _INFO:  'INFO: ',
+}
+
+def vprint(msg, severity=_INFO):
     '''Display verbose infos'''
-    if _VERBOSE:
-        print(msg)
+    if _VERBOSE or severity == _ERROR:
+        print(_VPRINT_PREFIX[severity] + msg)
+    if severity == _ERROR:
+        sys.exit(1)
 
 ################################################################################
 
@@ -101,102 +112,68 @@ def doit(args):
     basework = os.path.join(os.environ['HOME'], 'debbuildir')
     work = os.path.join(basework, osdistro, pkgname)
     sources = os.path.join(basedir, 'sources')
+    destmirror = args.destmirror
     mirror = args.mirror
 
     # Arguments validation
     if mirror not in _MIRRORS:
-        print('### invalid mirror: %s' % mirror)
-        sys.exit(1)
+        vprint('Invalid mirror: %s' % mirror, _ERROR)
 
     if not os.path.isdir(basework):
-        print("### Working directory '%s' doesn't exist." % basework)
-        sys.exit(1)
+        vprint("Working directory '%s' doesn't exist." % basework, _ERROR)
 
     if osdistid not in _DISTIDS:
-        print("### Unknown distribution: %s" % osdistid)
-        sys.exit(1)
+        vprint("Unknown distribution: %s" % osdistid, _ERROR)
 
     if not os.path.exists(sources):
-        print("### No `sources` file available in this directory.")
-        sys.exit(1)
+        vprint("No `sources` file available in this directory.", _ERROR)
 
-    if args.destmirror:
-        if args.mirror in args.destmirror:
-            print('You should not pass the mirror name in "--destmirror" as '
-                  'it is automatically added')
-            sys.exit(1)
-        if '-stable' in args.destmirror:
-            print('You should not pass "-stable" suffix in "--destmirror" as '
-                  'it is automatically added')
-            sys.exit(1)
+    if destmirror:
+        if args.mirror in destmirror:
+            vprint('You should not pass the mirror name in "--destmirror"'
+                   ' as it is automatically added', _ERROR)
+        if '-stable' in destmirror:
+            vprint('You should not pass "-stable" suffix in "--destmirror" as '
+                   'it is automatically added', _ERROR)
 
     # Use arguments or environment variables
     if args.arch:
         arch = args.arch
-        print('Using --arch CLI argument: ' + arch)
+        vprint('Using --arch CLI argument: ' + arch)
     elif 'ARCH' in os.environ:
         arch = os.environ['ARCH']
-        print('Using ARCH environment variable: ' + arch)
+        vprint('Using ARCH environment variable: ' + arch)
     else:
         arch = subprocess.check_output(['dpkg', '--print-architecture'])
         arch = arch.strip().decode('ascii')
-        print('Defaulting to `dpkg --print-architecture`: ' + arch)
+        vprint('Defaulting to `dpkg --print-architecture`: ' + arch)
 
     if args.release:
         release = args.release
-        print('Using --release CLI argument: ' + release)
+        vprint('Using --release CLI argument: ' + release)
     elif 'SDS_RELEASE' in os.environ:
         release = os.environ['SDS_RELEASE']
-        print('Using SDS_RELEASE environment variable: ' + release)
+        vprint('Using SDS_RELEASE environment variable: ' + release)
     else:
         git_branch = ['git', 'rev-parse', '--abbrev-ref', 'HEAD']
         release = subprocess.check_output(git_branch).strip().decode('ascii')
-        print('Using guessed version from current git repo branch: ' + release)
+        vprint('Using guessed version from current git repo branch: ' + release)
 
-    print("### Recreating working directory")
+    vprint("Recreating working directory")
 
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
 
-    print("### Downloading source files")
+    vprint("Downloading source files")
 
     wrkdst = parse_sources(sources, work)
 
-    print("### Building source package")
+    vprint("Building source package")
 
     dpkg_buildpackage(wrkdst, work)
 
-    print("### Building package")
+    vprint("Building package")
 
-    pbuilder(pkgname, work=work, arch=arch, release=release, osdistid=osdistid,
-             osdistcodename=osdistcodename, mirror=mirror,
-             unstable=args.unstable)
-    if args.destmirror:
-        pkgupload(args, work, arch, release, osdistid, osdistcodename, mirror)
-    else:
-        print("### Not uploading package(s)")
-
-
-def pbuilder_cfg_name(**kwargs):
-    '''Return the pbuilder config name'''
-    pb_cfg_fmt = "{osdistid}-{osdistcodename}-{arch}-{release}"
-    if kwargs['unstable']:
-        pb_cfg_fmt += "-unstable"
-    else:
-        pb_cfg_fmt += "-stable"
-    pb_cfg_fmt += "-{mirror}"
-    return pb_cfg_fmt.format(kwargs)
-
-
-def pkgupload(args, work, arch, release, osdistid, osdistcodename, mirror):
-    '''Upload package to specified mirror (args.destmirror), if any'''
-
-    destmirror = args.destmirror
-    print("### Uploading package(s)")
-    pkgdsc = [f for f in os.listdir(work) if f.endswith('.dsc')][0]
-    vprint('Using *.dsc file: ' + pkgdsc)
-    dsc = os.path.basename(pkgdsc)
-    pkg_basename = os.path.splitext(dsc)[0]
     pb_cfg_kwargs = {
         'osdistid': osdistid,
         'osdistcodename': osdistcodename,
@@ -204,64 +181,102 @@ def pkgupload(args, work, arch, release, osdistid, osdistcodename, mirror):
         'release': release,
         'mirror': mirror,
         'unstable': args.unstable,
+        'destmirror': destmirror,
     }
-    tgt_subdir = pbuilder_cfg_name(**pb_cfg_kwargs)
-    resultdir = os.path.join(_PBUILDER, tgt_subdir, 'result')
-    if is_mini_dinstall_target(mirror, release, args):
-        upload_pkg_dput(destmirror, resultdir, pkg_basename, pkgdsc, osdistid)
+
+    pbuilder(pkgname, work=work, **pb_cfg_kwargs)
+
+    if destmirror:
+        pkgupload(work=work, **pb_cfg_kwargs)
     else:
-        print('Unknown target repository:', destmirror)
-        sys.exit(1)
+        vprint("Not uploading package(s)")
 
 
-def is_mini_dinstall_target(tgt, release, args):
+def pbuilder_cfg_name(**kwargs):
+    '''Return the pbuilder config name'''
+    vprint('pbuilder_cfg_name(), kwargs:' + str(kwargs))
+    pb_cfg_fmt = "{osdistid}-{osdistcodename}-{arch}-{release}"
+    if kwargs['unstable']:
+        pb_cfg_fmt += "-unstable"
+    else:
+        pb_cfg_fmt += "-stable"
+    pb_cfg_fmt += "-{mirror}"
+    return pb_cfg_fmt.format(**kwargs)
+
+
+def pkgupload(work, **kwargs):
+    '''Upload package to specified mirror (args.destmirror), if any'''
+
+    vprint("Uploading package(s)")
+    pkgdsc = [f for f in os.listdir(work) if f.endswith('.dsc')][0]
+    vprint('Using *.dsc file: ' + pkgdsc)
+    dsc = os.path.basename(pkgdsc)
+    pkg_basename = os.path.splitext(dsc)[0]
+    tgt_subdir = pbuilder_cfg_name(**kwargs)
+    resultdir = os.path.join(_PBUILDER, tgt_subdir, 'result')
+    if is_mini_dinstall_target(**kwargs):
+        upload_pkg_dput(resultdir, pkg_basename, pkgdsc, **kwargs)
+    else:
+        vprint('Unknown target repository:', kwargs['destmirror'], _ERROR)
+
+
+def is_mini_dinstall_target(**kwargs):
     '''
     Check if the parameter is OK as a mini-dinstall target and also ensure it is
     consistent with the packaging release (repository branch or CLI argument)
     '''
 
+    tgt = kwargs['destmirror']
+    if '-' not in tgt:
+        vprint('Target repository does not contain any "-" character', _WARN)
+        return False
     elts = tgt.split('-')
+    if len(elts) == 1:
+        vprint('Target repository is missing (at least) one "-"-separated '
+               'element', _WARN)
+        return False
     if len(elts) == 2:
         name, version = elts
     elif len(elts) == 3:
         name, version, unstable = elts
         if unstable != 'unstable':
-            print("Target repository should ends with '-unstable' : %s" % tgt)
+            vprint("Target repository should ends with '-unstable' : %s" % tgt,
+                   _WARN)
             return False
-        if not args.unstable:
-            print('You did not pass the "-u / --unstable" CLI argument, but '
-                  'it looks like you should have: %s' % tgt)
-            # No return here, this one is only a warning
+        if not kwargs['unstable']:
+            vprint('You did not pass the "-u / --unstable" CLI argument, but '
+                   'it looks like you should have: %s' % tgt, _WARN)
+            # No return here, this one is only a harmless warning
     else:
-        print('Target repository name contains too much "-" characters:', tgt)
+        vprint('Target repository name contains too much "-" characters:', tgt,
+               _WARN)
         return False
-    if version != release:
-        print('WARNING: target repository (%s) / release (%s) mismatch' %
-              (version, release))
+    if version != kwargs['release']:
+        vprint('Target repository (%s) / release (%s) mismatch' %
+               (version, kwargs['release']), _WARN)
     if name not in _MDI_PROJECTS:
-        print('Unknown mini-dinstall project:', name)
+        vprint('Unknown mini-dinstall project: ' + name, _WARN)
         return False
     if version not in _MDI_VERSIONS:
-        print('Unknown mini-dinstall version:', version)
+        vprint('Unknown mini-dinstall version: ' + version, _WARN)
         return False
     return True
 
 
-def upload_pkg_dput(destmirror, resultdir, pkg_basename, pkgdsc, osdistid):
+def upload_pkg_dput(resultdir, pkg_basename, pkgdsc, **kwargs):
     '''Use `dput` & `mini-dinstall` to upload package to mirror'''
 
-    repo_codename = '%s-openio-%s' % (osdistid, destmirror)
-    print("### Uploading package %s to repository %s" % (pkgdsc, repo_codename))
+    repo_codename = '{osdistid}-openio-{destmirror}'.format(**kwargs)
+    vprint("Uploading package %s to repository %s" % (pkgdsc, repo_codename))
     dput = ['dput', '-f', '-u', repo_codename]
     changes_file_glob = os.path.join(resultdir, pkg_basename + '*.changes')
     changes_fn = glob.glob(changes_file_glob)
     if not changes_fn:
-        print('No match for: ' + changes_file_glob)
-        sys.exit(1)
+        vprint('No match for: ' + changes_file_glob, _ERROR)
     else:
         vprint('Found *.changes files: ' + str(changes_fn))
     dput.extend(changes_fn)
-    vprint(str(dput))
+    vprint('Launching dput command: ' + str(dput))
     subprocess.run(dput).check_returncode()
 
 
@@ -278,49 +293,61 @@ def parse_sources(sources, work):
                 continue
             items = line.split()
             if len(items) != 2:
-                vprint("Malformed 'sources' file: " + sources)
+                vprint("Malformed 'sources' file: " + sources, _ERROR)
             # VL: here we ignore dest & taropts as they are not currently used
-            src, filename, dest, taropt = items[0], items[1], '', ''
-            if dest == '-':
-                dest = ''
+            src, filename = items[0], items[1]
             if not filename:
                 filename = os.path.basename(src)
             wrkfn = os.path.join(work, filename)
             if src.startswith('http') or src.startswith('ftp'):
+                vprint('parse_sources(): downloading source file: ' + src +
+                       ', to: ' + wrkfn)
                 curl = ['curl', '-s', '-L', '-o', wrkfn, src]
                 subprocess.check_call(curl)
             else:
+                vprint('parse_sources(): copying local source file: ' + src +
+                       ', to: ' + wrkfn)
                 shutil.copy(src, wrkfn)
-            wrkdst = os.path.join(work, dest)
-            tar = ['tar', 'xf', wrkfn, '-C', wrkdst]
-            if taropt == 'strip1':
-                tar.extend("--strip-components", "1")
-            subprocess.check_call(tar)
 
-            # Assume a single tarball in sources
-            return wrkdst
+            # convert zip files to tar.gz as dpkg does not undestand zip files (wtf ?)
+            if filename.endswith('.zip'):
+                filename = filename.replace('.zip', '.tar.gz')
+                zipfn = wrkfn
+                wrkfn = os.path.join(work, filename)
+
+                vprint("Opening zip file for reading " + zipfn)
+                with ZipFile(zipfn) as zipf:
+                    vprint("Opening tar file for writing " + wrkfn)
+                    with tarfile.open(wrkfn, 'w:gz') as tarf:
+                        for zip_info in zipf.infolist():
+                            vprint("found file " + zip_info.filename + " size=" + str(zip_info.file_size))
+                            tar_info = tarfile.TarInfo(name=zip_info.filename)
+                            tar_info.size = zip_info.file_size
+                            # TODO handle copying mtime, rights, attr, ...
+                            #  tar_info.mtime = time.mktime(list(zip_info.date_time) + [-1, -1, -1])
+                            tarf.addfile(tarinfo=tar_info, fileobj=zipf.open(zip_info.filename))
+                os.unlink(zipfn)
+
+
+    return work
 
 
 def dpkg_buildpackage(wrkdst, work):
     '''Build source code package with dpkg-buildpackage'''
 
-    dircont = os.listdir(wrkdst)
-    vprint('dpkg_buildpackage(), dircont: ' + str(dircont))
+    vprint("dpkg_buildpackage wrkdst:" + wrkdst + ", work:" + work)
 
-    isdir = os.path.isdir
-    join = os.path.join
+    builddir = os.path.join(wrkdst, 'builddir')
+    debdir = os.path.join(builddir, 'debian')
 
-    tarsubdir = [d for d in dircont if isdir(join(wrkdst, d))][0]
-    tardir = join(wrkdst, tarsubdir)
-    debdir = join(tardir, 'debian')
-    shutil.rmtree(debdir, ignore_errors=True)
+    shutil.rmtree(builddir, ignore_errors=True)
+    os.mkdir(builddir)
     shutil.copytree('debian', debdir)
 
-    vprint('dpkg_buildpackage(), tardir: ' + str(os.listdir(tardir)))
-    vprint('dpkg_buildpackage(), work: ' + str(os.listdir(work)))
 
     dpkg_bp = ['dpkg-buildpackage', '-S', '-us', '-uc', '-nc', '-d']
-    subprocess.run(dpkg_bp, cwd=tardir).check_returncode()
+    vprint('Launching dpkg-buildpackage command: ' + str(dpkg_bp))
+    subprocess.run(dpkg_bp, cwd=builddir).check_returncode()
 
 
 def pbuilder(pkgname, work, **kwargs):
@@ -328,7 +355,7 @@ def pbuilder(pkgname, work, **kwargs):
 
     pbuilder_cmd = ['sudo', '-E', 'pbuilder', 'build']
     if pkgname in _PRIVATE_PKGS:
-        print("### Do not build source code package for closed-source project")
+        vprint("Do not build source code package for closed-source project")
         pbuilder_cmd.extend(["--debbuildopts", "-b"])
     pbuilder_cmd.extend(glob.glob(os.path.join(work, '*.dsc')))
     env = dict(os.environ)
@@ -394,7 +421,7 @@ def validate_args(args):
     global _VERBOSE # pylint: disable=global-statement
     if args.verbose:
         _VERBOSE = True
-        vprint('verbose mode')
+        vprint('Verbose mode')
 
 ################################################################################
 
